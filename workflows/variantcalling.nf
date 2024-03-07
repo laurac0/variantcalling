@@ -4,7 +4,7 @@
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 */
 
-include { paramsSummaryLog; paramsSummaryMap } from 'plugin/nf-validation'
+include { paramsSummaryLog; paramsSummaryMap; fromSamplesheet } from 'plugin/nf-validation'
 
 def logo = NfcoreTemplate.logo(workflow, params.monochrome_logs)
 def citation = '\n' + WorkflowMain.citation(workflow) + '\n'
@@ -14,6 +14,50 @@ def summary_params = paramsSummaryMap(workflow)
 log.info logo + paramsSummaryLog(workflow) + citation
 
 WorkflowVariantcalling.initialise(params, log)
+
+/*
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    CHECK MANDATORY PARAMETERS
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+*/
+
+def mandatoryParams = [
+    "analysis_type",
+    "fasta",
+    "input",
+    "sequence_dictionary"
+]
+
+if (params.analysis_type.equals("wes")) {
+    mandatoryParams += ["target_bed"]
+}
+
+def missingParamsCount = 0
+for (param in mandatoryParams.unique()) {
+    if (params[param] == null) {
+        println("params." + param + " not set.")
+        missingParamsCount += 1
+    }
+}
+
+if (missingParamsCount>0) {
+    error("\nSet missing parameters and restart the run. For more information please check usage documentation on github.\n\n")
+}
+
+// Check mandatory parameters
+
+ch_input = Channel.fromSamplesheet("input")
+            .map{ meta, mapped, index ->
+
+            if (meta.filetype != mapped.getExtension().toString()) {
+                error('The file extension does not fit the specified file_type.\n' + mapped.toString() )
+            }
+
+            meta.index  = index ? true : false
+
+            return [meta, mapped, index]
+
+            }
 
 /*
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -35,7 +79,8 @@ ch_multiqc_custom_methods_description = params.multiqc_methods_description ? fil
 //
 // SUBWORKFLOW: Consisting of a mix of local and nf-core/modules
 //
-include { INPUT_CHECK } from '../subworkflows/local/input_check'
+include { INPUT_CHECK       } from '../subworkflows/local/input_check'
+include { PREPARE_INDICES   } from '../subworkflows/local/prepare_indices'
 
 /*
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -46,7 +91,7 @@ include { INPUT_CHECK } from '../subworkflows/local/input_check'
 //
 // MODULE: Installed directly from nf-core/modules
 //
-include { FASTQC                      } from '../modules/nf-core/fastqc/main'
+include { GATK4_HAPLOTYPECALLER       } from '../modules/nf-core/gatk4/haplotypecaller/main'
 include { MULTIQC                     } from '../modules/nf-core/multiqc/main'
 include { CUSTOM_DUMPSOFTWAREVERSIONS } from '../modules/nf-core/custom/dumpsoftwareversions/main'
 
@@ -63,24 +108,42 @@ workflow VARIANTCALLING {
 
     ch_versions = Channel.empty()
 
-    //
-    // SUBWORKFLOW: Read in samplesheet, validate and stage input files
-    //
-    INPUT_CHECK (
-        file(params.input)
-    )
-    ch_versions = ch_versions.mix(INPUT_CHECK.out.versions)
-    // TODO: OPTIONAL, you can use nf-validation plugin to create an input channel from the samplesheet with Channel.fromSamplesheet("input")
-    // See the documentation https://nextflow-io.github.io/nf-validation/samplesheets/fromSamplesheet/
-    // ! There is currently no tooling to help you write a sample sheet schema
+    // Initialise and gather built indices
+    ch_genome_fasta             = Channel.fromPath(params.fasta).map { it -> [[id:it[0].simpleName], it] }.collect()
+    ch_genome_fai               = params.fai            ? Channel.fromPath(params.fai).map {it -> [[id:it[0].simpleName], it]}.collect()
+                                                        : Channel.empty()
+    ch_sequence_dictionary      = params.sequence_dictionary            ? Channel.fromPath(params.sequence_dictionary).map {it -> [[id:it[0].simpleName], it]}.collect()
+                                                        : Channel.empty()
+    ch_target_bed_unprocessed   = params.target_bed     ? Channel.fromPath(params.target_bed).map{ it -> [[id:it[0].simpleName], it] }.collect()
+                                                        : Channel.value([[],[]])
+    ch_dbsnp                    = params.known_dbsnp    ? Channel.fromPath(params.known_dbsnp).map{ it -> [[id:it[0].simpleName], it] }.collect()
+                                                        : Channel.value([[],[]])
+    ch_dbsnp_tbi                = params.known_dbsnp_tbi    ? Channel.fromPath(params.known_dbsnp_tbi).map{ it -> [[id:it[0].simpleName], it] }.collect()
+                                                        : Channel.value([[],[]]) 
+    ch_target_bed = params.target_bed ? Channel.fromPath(params.target_bed).map{ it -> [it] }.collect() : Channel.value([[],[]])
 
     //
-    // MODULE: Run FastQC
+    // SUBWORKFLOW: Prepare indices bai/crai/fai if not provided
     //
-    FASTQC (
-        INPUT_CHECK.out.reads
+    PREPARE_INDICES(
+        ch_input
     )
-    ch_versions = ch_versions.mix(FASTQC.out.versions.first())
+    ch_versions = ch_versions.mix(PREPARE_INDICES.out.versions)
+
+
+    // Assign BAM
+    input_bam = PREPARE_INDICES.out.genome_bam_bai
+    input_bam.combine(ch_target_bed)
+                .map{ meta, bam, bai, interval -> [ meta, bam, bai, interval, []]
+            }.set{ch_haplotypecaller_interval_bam}
+
+    //
+    // Variant calling
+    // 
+    if (params.analysis_type == "wes") {
+        GATK4_HAPLOTYPECALLER(ch_haplotypecaller_interval_bam, ch_genome_fasta, ch_genome_fai, ch_sequence_dictionary, ch_dbsnp, ch_dbsnp_tbi)
+    }
+    ch_versions = ch_versions.mix(GATK4_HAPLOTYPECALLER.out.versions)
 
     CUSTOM_DUMPSOFTWAREVERSIONS (
         ch_versions.unique().collectFile(name: 'collated_versions.yml')
@@ -99,7 +162,7 @@ workflow VARIANTCALLING {
     ch_multiqc_files = ch_multiqc_files.mix(ch_workflow_summary.collectFile(name: 'workflow_summary_mqc.yaml'))
     ch_multiqc_files = ch_multiqc_files.mix(ch_methods_description.collectFile(name: 'methods_description_mqc.yaml'))
     ch_multiqc_files = ch_multiqc_files.mix(CUSTOM_DUMPSOFTWAREVERSIONS.out.mqc_yml.collect())
-    ch_multiqc_files = ch_multiqc_files.mix(FASTQC.out.zip.collect{it[1]}.ifEmpty([]))
+    // ch_multiqc_files = ch_multiqc_files.mix(FASTQC.out.zip.collect{it[1]}.ifEmpty([]))
 
     MULTIQC (
         ch_multiqc_files.collect(),
@@ -109,6 +172,7 @@ workflow VARIANTCALLING {
     )
     multiqc_report = MULTIQC.out.report.toList()
 }
+
 
 /*
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
