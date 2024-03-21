@@ -32,6 +32,10 @@ if (params.analysis_type.equals("wes")) {
     mandatoryParams += ["target_bed"]
 }
 
+// if (!params.skip_cnv_calling) {
+//     mandatoryParams += ["ploidy_model", "gcnvcaller_model"]
+// }
+
 def missingParamsCount = 0
 for (param in mandatoryParams.unique()) {
     if (params[param] == null) {
@@ -79,8 +83,10 @@ ch_multiqc_custom_methods_description = params.multiqc_methods_description ? fil
 //
 // SUBWORKFLOW: Consisting of a mix of local and nf-core/modules
 //
-include { INPUT_CHECK       } from '../subworkflows/local/input_check'
-include { PREPARE_INDICES   } from '../subworkflows/local/prepare_indices'
+include { CHECK_INPUT                           } from '../subworkflows/local/check_input'
+include { INPUT_CHECK                           } from '../subworkflows/local/input_check'
+include { PREPARE_INDICES                       } from '../subworkflows/local/prepare_indices'
+include { BAM_VARIANT_CALLING_HAPLOTYPECALLER   } from '../subworkflows/local/bam_variant_calling_haplotypecaller'
 
 /*
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -91,9 +97,10 @@ include { PREPARE_INDICES   } from '../subworkflows/local/prepare_indices'
 //
 // MODULE: Installed directly from nf-core/modules
 //
-include { GATK4_HAPLOTYPECALLER       } from '../modules/nf-core/gatk4/haplotypecaller/main'
-include { MULTIQC                     } from '../modules/nf-core/multiqc/main'
-include { CUSTOM_DUMPSOFTWAREVERSIONS } from '../modules/nf-core/custom/dumpsoftwareversions/main'
+include { GATK4_HAPLOTYPECALLER       }         from '../modules/nf-core/gatk4/haplotypecaller/main'
+include { MULTIQC                     }         from '../modules/nf-core/multiqc/main'
+include { CUSTOM_DUMPSOFTWAREVERSIONS }         from '../modules/nf-core/custom/dumpsoftwareversions/main'
+include { SMNCOPYNUMBERCALLER         }         from '../modules/nf-core/smncopynumbercaller/main'
 
 /*
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -119,8 +126,15 @@ workflow VARIANTCALLING {
     ch_dbsnp                    = params.known_dbsnp    ? Channel.fromPath(params.known_dbsnp).map{ it -> [[id:it[0].simpleName], it] }.collect()
                                                         : Channel.value([[],[]])
     ch_dbsnp_tbi                = params.known_dbsnp_tbi    ? Channel.fromPath(params.known_dbsnp_tbi).map{ it -> [[id:it[0].simpleName], it] }.collect()
-                                                        : Channel.value([[],[]]) 
+                                                        : Channel.value([[],[]])
     ch_target_bed = params.target_bed ? Channel.fromPath(params.target_bed).map{ it -> [it] }.collect() : Channel.value([[],[]])
+
+    //
+    // Initialize input channels :: To get case_info
+    //
+    ch_input_path = "/home/laura/2024/nfcore_workflow/modularization/module_4/tests/samplesheet_default.csv"
+    CHECK_INPUT (ch_input_path)
+    ch_versions = ch_versions.mix(CHECK_INPUT.out.versions)
 
     //
     // SUBWORKFLOW: Prepare indices bai/crai/fai if not provided
@@ -130,20 +144,41 @@ workflow VARIANTCALLING {
     )
     ch_versions = ch_versions.mix(PREPARE_INDICES.out.versions)
 
-
     // Assign BAM
     input_bam = PREPARE_INDICES.out.genome_bam_bai
     input_bam.combine(ch_target_bed)
                 .map{ meta, bam, bai, interval -> [ meta, bam, bai, interval, []]
             }.set{ch_haplotypecaller_interval_bam}
 
+    ch_haplotypecaller_interval_bam
+        .collect { it[1] } // BAM files are at index 1 in the list
+        .toList()
+        .set { ch_bam_list }
+
+    ch_haplotypecaller_interval_bam
+        .collect { it[2] } // BAI files are at index 1 in the list
+        .toList()
+        .set { ch_bai_list }
+
+    CHECK_INPUT.out.case_info
+        .combine(ch_bam_list)
+        .combine(ch_bai_list)
+        .set { ch_bams_bais }
+
+    SMNCOPYNUMBERCALLER (
+        ch_bams_bais
+    )
+    ch_versions = ch_versions.mix(SMNCOPYNUMBERCALLER.out.versions)
+
+
     //
-    // Variant calling
-    // 
+    // SNV Variant calling
+    //
     if (params.analysis_type == "wes") {
-        GATK4_HAPLOTYPECALLER(ch_haplotypecaller_interval_bam, ch_genome_fasta, ch_genome_fai, ch_sequence_dictionary, ch_dbsnp, ch_dbsnp_tbi)
+        // GATK4_HAPLOTYPECALLER(ch_haplotypecaller_interval_bam, ch_genome_fasta, ch_genome_fai, ch_sequence_dictionary, ch_dbsnp, ch_dbsnp_tbi)
+        BAM_VARIANT_CALLING_HAPLOTYPECALLER(ch_haplotypecaller_interval_bam, ch_genome_fasta, ch_genome_fai, ch_sequence_dictionary, ch_dbsnp, ch_dbsnp_tbi)
     }
-    ch_versions = ch_versions.mix(GATK4_HAPLOTYPECALLER.out.versions)
+    ch_versions = ch_versions.mix(BAM_VARIANT_CALLING_HAPLOTYPECALLER.out.ch_versions)
 
     CUSTOM_DUMPSOFTWAREVERSIONS (
         ch_versions.unique().collectFile(name: 'collated_versions.yml')
